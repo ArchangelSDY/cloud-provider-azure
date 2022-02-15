@@ -79,7 +79,7 @@ NODE_MANAGER_FULL_IMAGE_NAME=$(IMAGE_REGISTRY)/$(NODE_MANAGER_IMAGE_NAME)
 NODE_MANAGER_IMAGE=$(NODE_MANAGER_FULL_IMAGE_NAME):$(IMAGE_TAG)
 NODE_MANAGER_LINUX_FULL_IMAGE_PREFIX=$(NODE_MANAGER_FULL_IMAGE_NAME):$(IMAGE_TAG)-linux
 NODE_MANAGER_WINDOWS_FULL_IMAGE_PREFIX=$(NODE_MANAGER_FULL_IMAGE_NAME):$(IMAGE_TAG)-windows
-ALL_NODE_MANAGER_IMAGES = $(foreach arch, ${ALL_ARCH.linux}, $(NODE_MANAGER_LINUX_FULL_IMAGE_PREFIX)-${arch}) $(foreach osversion-arch, ${ALL_OS_ARCH.windows}, $(NODE_MANAGER_WINDOWS_FULL_IMAGE_PREFIX)-${osversion-arch})
+ALL_NODE_MANAGER_WINDOWS_IMAGES = $(foreach osversion-arch, ${ALL_OS_ARCH.windows}, $(NODE_MANAGER_WINDOWS_FULL_IMAGE_PREFIX)-${osversion-arch})
 
 # ccm e2e test image
 CCM_E2E_TEST_IMAGE_NAME=cloud-provider-azure-e2e
@@ -118,42 +118,12 @@ $(BIN_DIR)/azure-acr-credential-provider.exe: $(PKG_CONFIG) $(wildcard cmd/acr-c
 ##@ Images
 ## --------------------------------------
 
-.PHONY: docker-pull-prerequisites
-docker-pull-prerequisites: ## Pull prerequisite images.
-	docker pull docker/dockerfile:1.3.1
-	docker pull docker.io/library/golang:1.17-buster
-	docker pull gcr.io/distroless/static:latest
-
 buildx-setup:
 	docker buildx inspect img-builder > /dev/null || docker buildx create --name img-builder --use
 	# enable qemu for arm64 build
 	# https://github.com/docker/buildx/issues/464#issuecomment-741507760
 	docker run --privileged --rm tonistiigi/binfmt --uninstall qemu-aarch64
 	docker run --rm --privileged tonistiigi/binfmt --install all
-
-.PHONY: build-ccm-image
-build-ccm-image: buildx-setup docker-pull-prerequisites ## Build controller-manager image.
-	docker buildx build \
-		--pull \
-		--output=type=$(OUTPUT_TYPE) \
-		--platform linux/$(ARCH) \
-		--build-arg ENABLE_GIT_COMMAND="$(ENABLE_GIT_COMMAND)" \
-		--build-arg ARCH="$(ARCH)" \
-		--build-arg VERSION="$(VERSION)" \
-		--file Dockerfile \
-		--tag $(IMAGE) .
-
-.PHONY: build-node-image-linux
-build-node-image-linux: buildx-setup docker-pull-prerequisites ## Build node-manager image.
-	docker buildx build \
-		--pull \
-		--output=type=$(OUTPUT_TYPE) \
-		--platform linux/$(ARCH) \
-		--build-arg ENABLE_GIT_COMMAND="$(ENABLE_GIT_COMMAND)" \
-		--build-arg ARCH="$(ARCH)" \
-		--build-arg VERSION="$(VERSION)" \
-		--file cloud-node-manager.Dockerfile \
-		--tag $(NODE_MANAGER_LINUX_FULL_IMAGE_PREFIX)-$(ARCH) .
 
 .PHONY: build-node-image-windows
 build-node-image-windows: buildx-setup $(BIN_DIR)/azure-cloud-node-manager.exe ## Build node-manager image for Windows.
@@ -168,14 +138,6 @@ build-node-image-windows: buildx-setup $(BIN_DIR)/azure-cloud-node-manager.exe #
 .PHONY: build-ccm-e2e-test-image
 build-ccm-e2e-test-image: ## Build e2e test image.
 	docker build -t $(CCM_E2E_TEST_IMAGE) -f ./e2e.Dockerfile .
-
-.PHONY: push-ccm-image
-push-ccm-image: build-ccm-image ## Push controller-manager image.
-	docker push $(IMAGE)
-
-.PHONY: push-node-image-linux
-push-node-image-linux: ## Push node-manager image for Linux.
-	docker push $(NODE_MANAGER_LINUX_FULL_IMAGE_PREFIX)-$(ARCH)
 
 .PHONY: release-ccm-e2e-test-image
 release-ccm-e2e-test-image: ## Build and release e2e test image.
@@ -201,17 +163,14 @@ build-images: image
 push-images: push
 
 .PHONY: image
-image: build-all-ccm-images build-all-node-images ## Build all images.
+image: build-all-images
 
 .PHONY: push
-push: push-all-ccm-images push-multi-arch-node-manager-image ## Push all images.
+push: build-all-images push-multi-arch-node-manager-image ## Push all images.
 
 .PHONY: push-multi-arch-node-manager-image ## Push multi-arch node-manager image
-push-multi-arch-node-manager-image: push-all-node-images ## Create and push a manifest list containing all the Windows and Linux images.
-	docker manifest create --amend $(NODE_MANAGER_IMAGE) $(ALL_NODE_MANAGER_IMAGES)
-	for arch in $(ALL_ARCH.linux); do \
-		docker manifest annotate --os linux --arch $${arch} $(NODE_MANAGER_IMAGE)  $(NODE_MANAGER_LINUX_FULL_IMAGE_PREFIX)-$${arch}; \
-	done
+push-multi-arch-node-manager-image: ## Create and push a manifest list containing all the Windows and Linux images.
+	docker manifest create --amend $(NODE_MANAGER_IMAGE) $(foreach osversion-arch, ${ALL_OS_ARCH.windows}, $(NODE_MANAGER_WINDOWS_FULL_IMAGE_PREFIX)-${osversion-arch})
 	# For Windows images, we also need to include the "os.version" in the manifest list, so the Windows node can pull the proper image it needs.
 	# we use awk to also trim the quotes around the OS version string.
 	set -x; \
@@ -223,52 +182,20 @@ push-multi-arch-node-manager-image: push-all-node-images ## Create and push a ma
 	done
 	docker manifest push --purge $(NODE_MANAGER_IMAGE)
 
-.PHONY: push-all-node-images ## Push node-manager image for os and archs.
-push-all-node-images: push-all-node-images-linux push-all-node-images-windows
+.PHONY: build-all-images
+build-all-images: buildx-setup
+	ENABLE_GIT_COMMAND="$(ENABLE_GIT_COMMAND)" VERSION="$(VERSION)" OUTPUT=registry docker buildx bake --pull  --progress plain -f buildx-bake.hcl 
 
-.PHONY: push-all-node-images-linux ## Push node-manager image for Linux.
-push-all-node-images-linux: $(addprefix push-node-image-linux-,$(ALL_ARCH.linux))
+build-ccm-image-%: buildx-setup
+	ENABLE_GIT_COMMAND="$(ENABLE_GIT_COMMAND)" VERSION="$(VERSION)" OUTPUT=registry docker buildx bake --pull  --progress plain -f buildx-bake.hcl ccm-$*
 
-.PHONY: push-all-node-images-windows ## Push node-manager image for Windows.
-push-all-node-images-windows: $(addprefix push-node-image-windows-,$(ALL_OS_ARCH.windows))
+.PHONY: build-ccm-image
+build-ccm-image: buildx-setup build-ccm-image-amd64 ## Build controller-manager image.
 
-# split words on hyphen, access by 1-index
-word-hyphen = $(word $2,$(subst -, ,$1))
-
-push-node-image-linux-%:
-	$(MAKE) ARCH=$* push-node-image-linux
-
-push-node-image-windows-%:
-	$(MAKE) WINDOWS_OSVERSION=$(call word-hyphen,$*,1) ARCH=$(call word-hyphen,$*,2) OUTPUT_TYPE=registry build-node-image-windows
-
-.PHONY: build-all-node-images ## Build node-manager image for all OS and archs.
-build-all-node-images: build-all-node-images-linux build-all-node-images-windows
-
-.PHONY: build-all-node-images-linux ## Build node-manager image for Linux.
-build-all-node-images-linux: $(addprefix build-node-image-linux-,$(ALL_ARCH.linux))
-
-.PHONY: build-all-node-images-windows ## Build node-manager image for Windows.
-build-all-node-images-windows: $(addprefix build-node-image-windows-,$(ALL_OS_ARCH.windows))
-
-build-node-image-linux-%:
-	$(MAKE) ARCH=$* build-node-image-linux
-
-build-node-image-windows-%:
-	$(MAKE) WINDOWS_OSVERSION=$(call word-hyphen,$*,1) ARCH=$(call word-hyphen,$*,2) build-node-image-windows
-
-.PHONY: build-all-ccm-images
-build-all-ccm-images: $(addprefix build-ccm-image-,$(ALL_ARCH.linux))
-
-build-ccm-image-%:
-	$(MAKE) ARCH=$* build-ccm-image
-
-.PHONY: push-all-ccm-images
-push-all-ccm-images: $(addprefix push-ccm-image-,$(ALL_ARCH.linux))
-
-push-ccm-image-%:
-	$(MAKE) ARCH=$* push-ccm-image
-
-
+.PHONY: build-ccm-image
+build-node-image-linux: buildx-setup 
+	ENABLE_GIT_COMMAND="$(ENABLE_GIT_COMMAND)" VERSION="$(VERSION)" OUTPUT=registry docker buildx bake --pull  --progress plain -f buildx-bake.hcl cnm-linux
+	
 ## --------------------------------------
 ##@ Tests
 ## --------------------------------------
